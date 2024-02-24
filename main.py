@@ -3,7 +3,7 @@ from signal     import signal, SIGINT
 from threading  import Thread, currentThread
 from builtins   import print as builtin_print
 
-from socket     import socket, socketpair, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
+from socket     import socket, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from select     import select
 from nclib      import Netcat
 
@@ -11,6 +11,8 @@ from nclib      import Netcat
 # Globals
 g_was_signal_caught       = False
 g_thread_print_names      = dict()
+
+
 
 # Override to prefix user-defined thread name
 def print(*args, **kwargs):
@@ -44,7 +46,7 @@ def signal_handler(signum, _frame):
 
 
 
-
+# Advanced Interact let's us Ctrl+C to exit.
 def _advanced_interact(client: Netcat):
     command = ''
     while command != 'exit':
@@ -66,6 +68,7 @@ def _advanced_interact(client: Netcat):
             break
     return
 
+# Starts a TCP server and listens for a single connection.
 def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
     global g_was_signal_caught
 
@@ -120,5 +123,5 @@ def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
 if __name__ == '__main__':
     signal(SIGINT, signal_handler)
     set_thread_print_name('Main')
-    listener('0.0.0.0', 6969, advanced_interact=False)
+    listener('0.0.0.0', 6969) #, advanced_interact=True)
     print('Done')
