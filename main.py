@@ -69,41 +69,42 @@ def _advanced_interact(client: Netcat):
 def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
     global g_was_signal_caught
 
-    was_connection_established = False
+    sock: socket        = socket(type=SOCK_STREAM)
+    host: tuple         = (ip, port)
+    client: Netcat      = None
+    is_connected: bool  = False
 
-    host = (ip, port)
-    sock = socket(type=SOCK_STREAM)
+    # Create TCP server
     sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     sock.bind(host)
     sock.listen(5)
-    _oob_rsock, _oob_wsock = socketpair()
     print('Listening on %s:%d' % host)
+
+    # Wait for a connection...
+    timeout = 1.0
     while True:
-        rl, _, _ = select([sock, _oob_rsock], [], [], 1.0)
-        if _oob_rsock in rl:
-            print('Something went wrong')
-            _oob_rsock.close()
-            _oob_wsock.close()
-            break
-        elif rl:
+        rfds, wfds, efds = select([sock], [], [], timeout)
+
+        # Did we receive an incoming connection request?
+        if rfds:
             _client, _addr = sock.accept()
             client = Netcat(sock=_client, server=_addr, **nc_kwargs)
-            was_connection_established = True
-            break
-        elif g_was_signal_caught:
-            break
-        else:
-            print('not yet')
+            
+            # How should we interact?
+            if advanced_interact:
+                _advanced_interact(client=client)
+            else:
+                client.interact()
 
-    if g_was_signal_caught:
-        print('Canceled before a connection request was received.')
-    elif was_connection_established:
-        if advanced_interact:
-            _advanced_interact()
-        else:
-            client.interact()
-        print('Disconnected.')
+            print('Disconnected.')
+            break
 
+        # Should we stop waiting for requests?
+        if g_was_signal_caught:
+            print('Canceled before a connection request was received.')
+            break
+
+    # Clean up
     if not client.closed:
         client.close()
     sock.close()
@@ -119,12 +120,5 @@ def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
 if __name__ == '__main__':
     signal(SIGINT, signal_handler)
     set_thread_print_name('Main')
-
-    print('-=-=- Start -=-=-')
-    
-    set_thread_print_name()
-    listener('0.0.0.0', 6969, advanced_interact=True)
-    # netcat('0.0.0.0', 6969, None)
-    set_thread_print_name('Main')
-    
-    print('-=-=- Done -=-=-')
+    listener('0.0.0.0', 6969, advanced_interact=False)
+    print('Done')
