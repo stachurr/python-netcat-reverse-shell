@@ -3,14 +3,15 @@ from signal     import signal, SIGINT
 from threading  import Thread, currentThread
 from builtins   import print as builtin_print
 
-from socket     import socket, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
+from socket     import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from select     import select
 from nclib      import Netcat
+from sys        import stdin
 
 
 # Globals
-g_was_signal_caught       = False
-g_thread_print_names      = dict()
+g_do_quit               = False
+g_thread_print_names    = dict()
 
 
 
@@ -26,7 +27,7 @@ def print(*args, **kwargs):
     return
 
 # Set/clear the calling thread's print name.
-def set_thread_print_name(name: str = None):
+def set_thread_name(name: str = None):
     global g_thread_print_names
 
     id = currentThread().ident
@@ -37,61 +38,107 @@ def set_thread_print_name(name: str = None):
     return
 
 # Catch interrupts.
-def signal_handler(signum, _frame):
-    global g_was_signal_caught
+def _signal_handler(signum, _frame):
+    global g_do_quit
 
-    g_was_signal_caught = True
+    g_do_quit = True
     print('-=-=- Caught signal %d -=-=-' % signum)
     return
 
 
 
+
 # Advanced Interact let's us Ctrl+C to exit.
+# TODO:
+#   - Make it more obvious what was typed vs what was received.
+#   - Arrow-key history (may not be possible without a key-logger).
+#   - Tab completion    (may not be possible without a key-logger).
 def _advanced_interact(client: Netcat):
-    command = ''
-    while command != 'exit':
-        try:
-            # get output until dollar sign (bash --posix forces bash-X.X$)
-            recv_bytes = client.read_until('$')
-            print(recv_bytes.decode('utf-8'), end='') # print string of received bytes
+    global g_do_quit
 
-            # get user input command and write command to socket
-            command = input(' ')
-            client.write(command + '\n')
+    fds_to_watch = [client.fileno(), stdin]
+    while not g_do_quit:
+        rfds, _, efds = select(fds_to_watch, [], fds_to_watch, 0.2)
 
-        except KeyboardInterrupt:
-            print('Keyboard Interrupt')
+        # Did an exceptional condition occur?
+        if efds:
+            print('Exceptional condition occured during advanced interaction.')
             break
-        
-        except Exception as e:
-            print('Unknown error:', e)
-            break
+
+        # Data is available! From who?
+        elif rfds:
+            for who in rfds:
+                # From STDIN -- send it to client.
+                if who == stdin:
+                    command = stdin.readline()
+                    if command == 'exit\n':
+                        return
+                    else:
+                        client.send(command)
+
+                # From client -- print it to console.
+                else:
+                    data = b''
+                    # Read all available data...
+                    while True:
+                        recv = client.recv(timeout=0.05)
+                        if len(recv) == 0:
+                            break
+                        elif g_do_quit:     # We don't want the client to be able to spam.
+                            return          # It could potentially lock us in this read-loop.
+                        else:
+                            data += recv
+                    # idx = data.rfind(b'\n')
+                    # if idx == -1:
+                    #     data = b'[evil] ' + data
+                    # else:
+                    #     idx += 1
+                    #     data = data[:idx] + b'[evil] ' + data[idx:]
+                    print(data.decode("utf-8").strip(), end=' ', flush=True)
     return
 
 # Starts a TCP server and listens for a single connection.
-def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
-    global g_was_signal_caught
+def tcp_server(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
+    global g_do_quit
 
-    sock: socket        = socket(type=SOCK_STREAM)
-    host: tuple         = (ip, port)
-    client: Netcat      = None
-    is_connected: bool  = False
+    # Remove Netcat constuctor arguments which are used by us.
+    if nc_kwargs.pop('sock', None) is not None:
+        print('Keyword argument "sock" will be ignored.')
+    elif nc_kwargs.pop('server', None) is not None:
+        print('Keyword argument "server" will be ignored.')
 
-    # Create TCP server
-    sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    sock.bind(host)
-    sock.listen(5)
-    print('Listening on %s:%d' % host)
+    # Create TCP server.
+    where    = (ip, port)
+    backlog  = 0    # The number of unaccepted connections to allow
+                    # before refusing new connections.
+    tcp_sock = socket(family=AF_INET, type=SOCK_STREAM)
+    tcp_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    tcp_sock.bind(where)
+    tcp_sock.listen(backlog)
+    print('Listening on %s:%d' % where)
 
     # Wait for a connection...
-    timeout = 1.0
     while True:
-        rfds, wfds, efds = select([sock], [], [], timeout)
+        # Wait for any event. Using a timeout gives us execution time periodically.
+        timeout = 0.2
+        rfds, _, efds = select([tcp_sock], [], [tcp_sock], timeout)
+    
 
-        # Did we receive an incoming connection request?
-        if rfds:
-            _client, _addr = sock.accept()
-            client = Netcat(sock=_client, server=_addr, **nc_kwargs)
+        # 1) Should we stop waiting for requests?
+        if g_do_quit:
+            print('Signal caught -- no longer accepting connections.')
+            break
+
+        # 2) Did an exceptional condition occur?
+        elif efds:
+            print('Exceptional condition on TCP socket. Potentially out-of-band data.')
+            break
+
+        # 3) Did we receive an incoming connection request?
+        elif rfds:
+            client, addr = tcp_sock.accept()
+            client = Netcat(sock=client, server=addr, **nc_kwargs)
+            print('Connected to %s:%d' % addr)
             
             # How should we interact?
             if advanced_interact:
@@ -102,26 +149,19 @@ def listener(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
             print('Disconnected.')
             break
 
-        # Should we stop waiting for requests?
-        if g_was_signal_caught:
-            print('Canceled before a connection request was received.')
-            break
-
     # Clean up
     if not client.closed:
         client.close()
-    sock.close()
+    tcp_sock.close()
     return
 
 
 
 
-
-
-
-
+HOST = '0.0.0.0'
+PORT = 6969
 if __name__ == '__main__':
-    signal(SIGINT, signal_handler)
-    set_thread_print_name('Main')
-    listener('0.0.0.0', 6969) #, advanced_interact=True)
+    signal(SIGINT, _signal_handler)
+    # set_thread_name('Main')
+    tcp_server(HOST, PORT, advanced_interact=True)
     print('Done')
