@@ -31,13 +31,15 @@ g_thread_print_names    = dict()
 
 
 # Override to prefix user-defined thread name
-def print(*args, **kwargs):
+def print(*args, no_name = False, **kwargs):
     global g_thread_print_names
 
-    id = current_thread().ident
-    prefix = g_thread_print_names.get(id)
-    if prefix is not None:
-        args = (prefix, *args)
+    if not no_name:
+        id = current_thread().ident
+        prefix = g_thread_print_names.get(id, None)
+        if prefix is not None:
+            args = (prefix, *args)
+
     builtin_print(*args, **kwargs)
     return
 
@@ -81,11 +83,19 @@ def _name(name: str, func, *args, **kwargs):
 def _advanced_interact(client: Netcat):
     global g_do_quit
 
-    fds_to_watch = [client.fileno(), stdin]
+    response_lpad = '    '
+    prompt_prefix = '(%s:%d) ' % client.peer
+    fds_to_watch  = [client.fileno(), stdin]
+
+    client_prompt_suffix = b''
+    command_history      = []
+    is_first_recv        = True
+    
     while not g_do_quit:
+        # Wait for any fd to become available for reading.
         rfds, _, efds = select(fds_to_watch, [], fds_to_watch, 0.2)
 
-        # Did an exceptional condition occur?
+        # Did an "exceptional condition" occur?
         if efds:
             print('Exceptional condition occured during advanced interaction.')
             break
@@ -95,36 +105,79 @@ def _advanced_interact(client: Netcat):
             for who in rfds:
                 # From STDIN -- send it to client.
                 if who == stdin:
-                    command = stdin.readline()
-                    if command == 'exit\n':
+                    command = stdin.readline().strip()
+                    if command == 'exit':
                         return
-                    else:
-                        client.send(command)
+                    
+                    client.send_line(command)
+                    command_history.append(command)
 
                 # From client -- print it to console.
                 else:
-                    data = b''
                     # Read all available data...
+                    data_bytes = b''
                     while True:
-                        recv = client.recv(timeout=0.05)
-                        if len(recv) == 0:
-                            break
-                        elif g_do_quit:     # We don't want the client to be able to spam.
-                            return          # It could potentially lock us in this read-loop.
+                        # Greedy timeout since we know `client_prompt_suffix`.
+                        # Note: This may leave unread trailing whitespace in the buffer.
+                        if not is_first_recv:
+                            recv = client.recv(timeout=0.05)
+                            if g_do_quit:           # We don't want the client to be able to spam.
+                                return              # It could potentially lock us in this read-loop.
+                            elif len(recv) > 0:
+                                data_bytes += recv
+
+                                # Did we get the full response yet?
+                                if recv.endswith(client_prompt_suffix):
+                                    break
+
+                        # Generous timeout. We want to make sure we get the full response on
+                        # the first time we communicate because we use the client prompt to
+                        # parse all future responses.
                         else:
-                            data += recv
-                    # idx = data.rfind(b'\n')
-                    # if idx == -1:
-                    #     data = b'[evil] ' + data
-                    # else:
-                    #     idx += 1
-                    #     data = data[:idx] + b'[evil] ' + data[idx:]
-                    s = data.decode('utf-8').strip()
+                            recv = client.recv(timeout=0.25)
+                            if g_do_quit:           # We don't want the client to be able to spam.
+                                return              # It could potentially lock us in this read-loop.
+                            elif len(recv) == 0:
+                                break
+                            
+                            data_bytes += recv
+
+                    # Convert bytes to list of lines as strings.
+                    data_str_raw = data_bytes.decode('utf-8')
+                    data_str     = data_str_raw.strip()
+                    lines        = data_str.split('\n')
+
+                    # # Remove ANSI sequences.
                     # s = sub('\x1b\[[\\d;]+?m', '', s)
                     # for c in s:
                     #     print(c.encode(), ord(c))
                     # return
-                    print(s, end=' ', flush=True)
+
+                    # If the last command entered is prefixed in the
+                    # clients response, remove it before printing.
+                    if not is_first_recv:
+                        if lines[0] == command_history[-1]:
+                            lines = lines[1:]
+                    
+                    # Upon initial connection, determine the suffix of the clients prompt.
+                    # This is used for the remaining duration of the connection to parse
+                    # responses from the client.
+                    else:
+                        last_visible_char = data_str[-1]
+                        idx = data_str_raw.rfind(last_visible_char)
+                        if idx == -1:
+                            raise 'Failed to parse client prompt for suffix!'
+                        client_prompt_suffix = data_str_raw[idx:].encode('utf-8')
+
+                    # Save the client prompt and remove it from list of lines.
+                    client_prompt = lines.pop(-1)
+                    
+                    # Format client response then print.
+                    s = '\x1b[93m%s%s\x1b[0m\n%s%s' % (response_lpad, f'\n{response_lpad}'.join(lines), prompt_prefix, client_prompt)
+                    print(s, no_name=True, end=' ', flush=True)
+
+        is_first_recv = False
+                    
     return
 
 # Starts a TCP server and listens for a single connection.
@@ -154,7 +207,6 @@ def tcp_server(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs)
         timeout = 0.2
         rfds, _, efds = select([tcp_sock], [], [tcp_sock], timeout)
     
-
         # 1) Should we stop waiting for requests?
         if g_do_quit:
             print('Signal caught -- no longer accepting connections.')
@@ -169,22 +221,25 @@ def tcp_server(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs)
         elif rfds:
             client, addr = tcp_sock.accept()
             client = Netcat(sock=client, server=addr, **nc_kwargs)
-            print('Connected to %s:%d' % addr)
+            addr_str = '%s:%d' % addr
+            print('Connected to', addr_str)
             
             # How should we interact?
             if advanced_interact:
                 # _advanced_interact(client=client)
-                _name('Advanced Interact', _advanced_interact, client=client)
+                _name(addr_str, _advanced_interact, client=client)
             else:
                 # client.interact()
                 _name('Interact', client.interact)
 
+            # Close connection.
+            if not client.closed:
+                client.close()
+
             print(ansi.red('Disconnected.'))
             break
 
-    # Clean up
-    if not client.closed:
-        client.close()
+    # Close TCP server.
     tcp_sock.close()
     return
 
