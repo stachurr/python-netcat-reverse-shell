@@ -1,12 +1,27 @@
 from time       import time, sleep
 from signal     import signal, SIGINT
-from threading  import Thread, currentThread
 from builtins   import print as builtin_print
 
 from socket     import socket, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 from select     import select
 from nclib      import Netcat
-from sys        import stdin
+from sys        import version_info, stdin
+from re         import sub
+import ansi
+
+if version_info.major >= 3:
+    if version_info.major == 3 and version_info.minor < 10:
+        _use_new_cur_thread = False
+    else:
+        _use_new_cur_thread = True
+if _use_new_cur_thread:
+    from threading import Thread, current_thread
+    current_thread = current_thread
+else:
+    from threading import Thread, currentThread
+    current_thread = currentThread
+
+# from named_functions import Name
 
 
 # Globals
@@ -19,7 +34,7 @@ g_thread_print_names    = dict()
 def print(*args, **kwargs):
     global g_thread_print_names
 
-    id = currentThread().ident
+    id = current_thread().ident
     prefix = g_thread_print_names.get(id)
     if prefix is not None:
         args = (prefix, *args)
@@ -27,14 +42,14 @@ def print(*args, **kwargs):
     return
 
 # Set/clear the calling thread's print name.
-def set_thread_name(name: str = None):
+def set_thread_name(name: str = None, prefix: str = '[', suffix: str = ']'):
     global g_thread_print_names
 
-    id = currentThread().ident
-    if name is None or len(name) == 0:
+    id = current_thread().ident
+    if name is None or name == '':
         g_thread_print_names.pop(id, None)
     else:
-        g_thread_print_names[id] = f'[{name}]'
+        g_thread_print_names[id] = prefix + name + suffix
     return
 
 # Catch interrupts.
@@ -45,6 +60,16 @@ def _signal_handler(signum, _frame):
     print('-=-=- Caught signal %d -=-=-' % signum)
     return
 
+# Cheeky use of `g_thread_print_names` to give a function a name.
+def _name(name: str, func, *args, **kwargs):
+    global g_thread_print_names
+
+    prev_name = g_thread_print_names.get(current_thread().ident, None)[1:-1]
+    set_thread_name(name)
+    ret = func(*args, **kwargs)
+    set_thread_name(prev_name)
+
+    return ret
 
 
 
@@ -94,12 +119,18 @@ def _advanced_interact(client: Netcat):
                     # else:
                     #     idx += 1
                     #     data = data[:idx] + b'[evil] ' + data[idx:]
-                    print(data.decode("utf-8").strip(), end=' ', flush=True)
+                    s = data.decode('utf-8').strip()
+                    # s = sub('\x1b\[[\\d;]+?m', '', s)
+                    # for c in s:
+                    #     print(c.encode(), ord(c))
+                    # return
+                    print(s, end=' ', flush=True)
     return
 
 # Starts a TCP server and listens for a single connection.
+# @Name('[TCP Server]')
 def tcp_server(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs):
-    global g_do_quit
+    global g_do_quit, g_thread_print_names
 
     # Remove Netcat constuctor arguments which are used by us.
     if nc_kwargs.pop('sock', None) is not None:
@@ -142,11 +173,13 @@ def tcp_server(ip: str, port: int, advanced_interact: bool = False, **nc_kwargs)
             
             # How should we interact?
             if advanced_interact:
-                _advanced_interact(client=client)
+                # _advanced_interact(client=client)
+                _name('Advanced Interact', _advanced_interact, client=client)
             else:
-                client.interact()
+                # client.interact()
+                _name('Interact', client.interact)
 
-            print('Disconnected.')
+            print(ansi.red('Disconnected.'))
             break
 
     # Clean up
@@ -162,6 +195,6 @@ HOST = '0.0.0.0'
 PORT = 6969
 if __name__ == '__main__':
     signal(SIGINT, _signal_handler)
-    # set_thread_name('Main')
+    set_thread_name('TCP Server')
     tcp_server(HOST, PORT, advanced_interact=True)
     print('Done')
