@@ -22,7 +22,10 @@ else:
     current_thread = currentThread
 
 # from named_functions import Name
+from tty        import setcbreak, setraw
+from termios    import tcgetattr, tcsetattr, TCSANOW, TCSAFLUSH, TCSADRAIN
 
+farb = int(0xff).to_bytes(length=1, byteorder='big', signed=False)
 
 # Globals
 g_do_quit               = False
@@ -60,6 +63,7 @@ def _signal_handler(signum, _frame):
 
     g_do_quit = True
     print('-=-=- Caught signal %d -=-=-' % signum)
+
     return
 
 # Cheeky use of `g_thread_print_names` to give a function a name.
@@ -74,24 +78,90 @@ def _name(name: str, func, *args, **kwargs):
     return ret
 
 
+def cursor_save_pos():
+    builtin_print('\x1b[s', end='', flush=True)
 
-# Advanced Interact let's us Ctrl+C to exit.
+def cursor_load_pos():
+    builtin_print('\x1b[u', end='', flush=True)
+
+def cursor_left(n: int = 1):
+    n = min(255, max(0, n))
+    builtin_print('\x1b[%dD' % n, end='', flush=True)
+
+
+
+
+# Advanced Interact let's us Ctrl+C to exit among other things:
 # TODO:
 #   - Make it more obvious what was typed vs what was received.
-#   - Arrow-key history (may not be possible without a key-logger).
-#   - Tab completion    (may not be possible without a key-logger).
-def _advanced_interact(client: Netcat):
+#   - Arrow-key history (may not be possible without a key-logger or etc.)
+#   - Tab completion    (may not be possible without a key-logger or etc.)
+DO_TERMIOS = True
+def _stdin_monitor(newline_callback):
+    global g_do_quit
+
+    set_thread_name('STDIN Monitor')
+    print('Hello, World!')
+
+    user_stdin = ''
+    history = []
+
+    while not g_do_quit:
+        _in = stdin.read(1) # TODO: How does one avoid a blocking call here?
+        print(_in.encode('utf-8'))
+        
+        # Ctrl-c
+        if _in.encode('utf-8') == b'\x03':
+            g_do_quit = True
+        # Newline
+        elif _in == '\n' or _in == '\r':
+            history.append(user_stdin)
+            # builtin_print()
+
+            do_continue = newline_callback(user_stdin)
+            if not do_continue:
+                break
+            
+            user_stdin = ''
+        # Backspace
+        elif _in == '\x7f':
+            user_stdin = user_stdin[:-1]
+            # cursor_left()
+            # builtin_print(' ', end='', flush=True)
+            # cursor_left()
+        # Other
+        else:
+            user_stdin += _in
+            # builtin_print(user_stdin[-1], end='', flush=True)
+    
+    print('Terminating...')
+    return
+
+def __advanced_interact(client: Netcat):
     global g_do_quit
 
     response_lpad = '    '
     prompt_prefix = '(%s:%d) ' % client.peer
     fds_to_watch  = [client.fileno(), stdin]
+    if DO_TERMIOS:
+        fds_to_watch = [client.fileno()]
 
     client_prompt_suffix = b''
     command_history      = []
     is_first_recv        = True
+
+    # t = Thread(target=_stdin_monitor) # DO_TERMIOS
+    # t.start() # DO_TERMIOS
+    # t.join() # DO_TERMIOS
+    # return # DO_TERMIOS
+    ### WARNING
+    ### Need to modify this loop to not return without joining thread!!!!!!!!!
     
     while not g_do_quit:
+        # _in = stdin.read(1)
+        # # print(f'{_in = }')
+        # continue
+        
         # Wait for any fd to become available for reading.
         rfds, _, efds = select(fds_to_watch, [], fds_to_watch, 0.2)
 
@@ -155,9 +225,10 @@ def _advanced_interact(client: Netcat):
 
                     # If the last command entered is prefixed in the
                     # clients response, remove it before printing.
-                    if not is_first_recv:
-                        if lines[0] == command_history[-1]:
-                            lines = lines[1:]
+                    if not DO_TERMIOS:
+                        if not is_first_recv:
+                            if lines[0] == command_history[-1]:
+                                lines = lines[1:]
                     
                     # Upon initial connection, determine the suffix of the clients prompt.
                     # This is used for the remaining duration of the connection to parse
@@ -176,9 +247,34 @@ def _advanced_interact(client: Netcat):
                     s = '\x1b[93m%s%s\x1b[0m\n%s%s' % (response_lpad, f'\n{response_lpad}'.join(lines), prompt_prefix, client_prompt)
                     print(s, no_name=True, end=' ', flush=True)
 
-        is_first_recv = False
-                    
+                    # if DO_TERMIOS:
+                    #     cursor_save_pos()
+
+        is_first_recv = False          
     return
+
+def _advanced_interact(client: Netcat):
+    prev_termios_config = None
+    t = None
+
+    if DO_TERMIOS:
+        def ___newline_callback(line: str) -> bool:
+            client.send_line(line)
+            return line != 'exit'
+        prev_termios_config = tcgetattr(stdin)
+        # setcbreak(stdin, TCSADRAIN)
+        setraw(stdin, TCSADRAIN)
+        t = Thread(target=_stdin_monitor, args=(___newline_callback,))
+        t.start()
+    
+    try:
+        __advanced_interact(client=client)
+    except Exception as e:
+        print('Exception in __advanced_interact:', e)
+
+    if DO_TERMIOS:
+        t.join()
+        tcsetattr(stdin, TCSADRAIN, prev_termios_config)
 
 # Starts a TCP server and listens for a single connection.
 # @Name('[TCP Server]')
